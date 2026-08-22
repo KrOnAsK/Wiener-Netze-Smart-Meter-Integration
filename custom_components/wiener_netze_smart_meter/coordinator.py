@@ -23,7 +23,6 @@ from .const import (
     CONF_PRICE_ENTITY,
     COST_CURRENCY,
     DOMAIN,
-    SHORT_TERM_STATS_DAYS,
     UPDATE_INTERVAL_HOURS,
 )
 from .logic import (
@@ -290,8 +289,13 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
                     )
                 )
 
+        # Short-term statistics live for purge_keep_days, so ask the recorder
+        # what that actually is. Assuming the default would both miss precision
+        # on instances that keep more and query dead range on ones that keep less.
         short_term_start = max(
-            start_dt, datetime.now(timezone.utc) - timedelta(days=SHORT_TERM_STATS_DAYS)
+            start_dt,
+            datetime.now(timezone.utc)
+            - timedelta(days=get_instance(self.hass).keep_days),
         )
         if short_term_start < end_dt:
             tiers.append(
