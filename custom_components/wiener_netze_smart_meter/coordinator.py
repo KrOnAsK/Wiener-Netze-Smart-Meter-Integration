@@ -23,14 +23,18 @@ from .const import (
     CONF_PRICE_ENTITY,
     COST_CURRENCY,
     DOMAIN,
+    SHORT_TERM_STATS_DAYS,
     UPDATE_INTERVAL_HOURS,
 )
 from .logic import (
     MeterReading,
+    PriceSchedule,
+    PriceStep,
     bucket_hourly,
     compute_hourly_cost,
     latest_daily_reading,
     parse_price_data,
+    price_scale,
     quarter_hour_messwerte,
 )
 
@@ -98,6 +102,7 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
             name=f"Smart meter {zaehlpunkt[-6:]} hourly energy",
             source=DOMAIN,
             statistic_id=f"{DOMAIN}:{zaehlpunkt.lower()}_hourly_energy",
+            unit_class="energy",
             unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         )
 
@@ -108,6 +113,9 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
             name=f"Smart meter {zaehlpunkt[-6:]} hourly cost",
             source=DOMAIN,
             statistic_id=f"{DOMAIN}:{zaehlpunkt.lower()}_hourly_cost",
+            # A currency has no unit converter, and HA rejects an unknown
+            # unit_class outright, so None is the correct value here.
+            unit_class=None,
             unit_of_measurement=COST_CURRENCY,
         )
 
@@ -153,33 +161,24 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
         try:
             metadata = self._cost_metadata(zaehlpunkt)
             total, start_after = await self._last_sum(metadata["statistic_id"])
-            window_start = start_after or (
-                datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
-            )
+            now = datetime.now(timezone.utc)
+            window_start = start_after or (now - timedelta(days=BACKFILL_DAYS))
             von = window_start.strftime("%Y-%m-%d")
             bis = datetime.now().strftime("%Y-%m-%d")
 
             messwerte = await self.hass.async_add_executor_job(
                 quarter_hour_messwerte, self.client, zaehlpunkt, von, bis
             )
-            energy_buckets = bucket_hourly(messwerte)
-            price_map = await self._build_price_map(
-                price_entity, window_start, datetime.now(timezone.utc)
-            )
+            tiers = await self._build_price_tiers(price_entity, window_start, now)
 
-            rows = compute_hourly_cost(
-                energy_buckets, price_map, start_after=start_after, starting_total=total
+            result = compute_hourly_cost(
+                messwerte, tiers, start_after=start_after, starting_total=total
             )
-            _LOGGER.debug(
-                "cost(update) %s: energy_hours=%d price_hours=%d rows=%d entity=%s",
-                zaehlpunkt,
-                len(energy_buckets),
-                len(price_map),
-                len(rows),
-                price_entity,
-            )
-            if rows:
-                stats = [StatisticData(start=h, state=c, sum=s) for h, c, s in rows]
+            self._log_cost_result("update", zaehlpunkt, price_entity, tiers, result)
+            if result.rows:
+                stats = [
+                    StatisticData(start=h, state=c, sum=s) for h, c, s in result.rows
+                ]
                 async_add_external_statistics(self.hass, metadata, stats)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Cost import failed for %s", zaehlpunkt)
@@ -217,21 +216,15 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
             price_entity = self.entry.options.get(CONF_PRICE_ENTITY)
             if price_entity:
                 try:
-                    price_map = await self._build_price_map(
+                    tiers = await self._build_price_tiers(
                         price_entity, buckets[0][0], datetime.now(timezone.utc)
                     )
-                    rows = compute_hourly_cost(buckets, price_map, starting_total=0.0)
-                    _LOGGER.debug(
-                        "cost(full) %s: energy_hours=%d price_hours=%d rows=%d entity=%s",
-                        zaehlpunkt,
-                        len(buckets),
-                        len(price_map),
-                        len(rows),
-                        price_entity,
-                    )
-                    if rows:
+                    result = compute_hourly_cost(messwerte, tiers, starting_total=0.0)
+                    self._log_cost_result("full", zaehlpunkt, price_entity, tiers, result)
+                    if result.rows:
                         stats = [
-                            StatisticData(start=h, state=c, sum=s) for h, c, s in rows
+                            StatisticData(start=h, state=c, sum=s)
+                            for h, c, s in result.rows
                         ]
                         async_add_external_statistics(
                             self.hass, self._cost_metadata(zaehlpunkt), stats
@@ -240,25 +233,107 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
                     _LOGGER.exception("Full-history cost import failed for %s", zaehlpunkt)
             _LOGGER.info("Full history import done for %s", zaehlpunkt)
 
+    def _log_cost_result(self, phase, zaehlpunkt, price_entity, tiers, result) -> None:
+        _LOGGER.debug(
+            "cost(%s) %s: tiers=%s exact=%d skipped=%d rows=%d entity=%s",
+            phase,
+            zaehlpunkt,
+            [len(tier) for tier in tiers],
+            result.exact_hours,
+            result.skipped_hours,
+            len(result.rows),
+            price_entity,
+        )
+        if result.skipped_hours:
+            _LOGGER.debug(
+                "cost(%s) %s: %d hour(s) had no usable price and were left out",
+                phase,
+                zaehlpunkt,
+                result.skipped_hours,
+            )
+
     # --- price lookup ---
 
-    async def _build_price_map(
+    async def _build_price_tiers(
         self, price_entity: str, start_dt: datetime, end_dt: datetime
-    ) -> dict[datetime, float]:
-        """Hour-start (UTC) -> price/kWh, from the price entity's hourly stats,
-        overlaid with its live forecast attribute for the most recent hours."""
-        prices: dict[datetime, float] = {}
+    ) -> list[PriceSchedule]:
+        """Price schedules for the window, finest source first.
 
+        1. The entity's own published schedule attribute — exact, but it only
+           covers today/tomorrow, so with 1-2 day lagged meter data it seldom
+           overlaps the hours being priced.
+        2. Recorder's 5-minute short-term statistics, which reconstruct
+           quarter-hour price steps exactly but only reach back ~10 days.
+        3. Hourly statistics, kept indefinitely, at hourly resolution.
+        """
+        state = self.hass.states.get(price_entity)
+        if state is None:
+            _LOGGER.warning(
+                "Price entity %s has no state; assuming its statistics are already "
+                "per-kWh in %s",
+                price_entity,
+                COST_CURRENCY,
+            )
+        scale = price_scale(
+            state.attributes.get("unit_of_measurement") if state else None
+        )
+
+        tiers: list[PriceSchedule] = []
+
+        if state is not None:
+            attribute_steps = parse_price_data(state.attributes.get("data") or [])
+            if attribute_steps:
+                tiers.append(
+                    PriceSchedule(
+                        PriceStep(step.start, step.end, step.price * scale)
+                        for step in attribute_steps
+                    )
+                )
+
+        short_term_start = max(
+            start_dt, datetime.now(timezone.utc) - timedelta(days=SHORT_TERM_STATS_DAYS)
+        )
+        if short_term_start < end_dt:
+            tiers.append(
+                await self._statistics_schedule(
+                    price_entity,
+                    short_term_start,
+                    end_dt,
+                    "5minute",
+                    timedelta(minutes=5),
+                    scale,
+                )
+            )
+
+        tiers.append(
+            await self._statistics_schedule(
+                price_entity, start_dt, end_dt, "hour", timedelta(hours=1), scale
+            )
+        )
+        return [tier for tier in tiers if tier]
+
+    async def _statistics_schedule(
+        self,
+        price_entity: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        period: str,
+        width: timedelta,
+        scale: float,
+    ) -> PriceSchedule:
+        """Price steps from the entity's recorded statistics at one period."""
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
             start_dt,
             end_dt,
             {price_entity},
-            "hour",
+            period,
             None,
             {"mean"},
         )
+
+        steps: list[PriceStep] = []
         for row in stats.get(price_entity, []):
             if row.get("mean") is None:
                 continue
@@ -268,10 +343,5 @@ class WNSmartMeterCoordinator(DataUpdateCoordinator[dict[str, MeterReading]]):
                 if isinstance(raw, datetime)
                 else datetime.fromtimestamp(raw, tz=timezone.utc)
             )
-            hour = start.replace(minute=0, second=0, microsecond=0)
-            prices[hour] = row["mean"]
-
-        state = self.hass.states.get(price_entity)
-        if state:
-            prices.update(parse_price_data(state.attributes.get("data") or []))
-        return prices
+            steps.append(PriceStep(start, start + width, row["mean"] * scale))
+        return PriceSchedule(steps)

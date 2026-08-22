@@ -16,3 +16,8 @@ UPDATE_INTERVAL_HOURS = 12
 # Days of quarter-hour history to pull on first run (no statistics yet).
 # Raise for more historical backfill on the Energy dashboard.
 BACKFILL_DAYS = 30
+
+# Recorder keeps 5-minute short-term statistics for roughly purge_keep_days
+# (default 10). Inside that window a price entity's quarter-hour steps can be
+# reconstructed exactly; older hours only have hourly means to fall back on.
+SHORT_TERM_STATS_DAYS = 10

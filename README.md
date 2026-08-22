@@ -72,28 +72,68 @@ Add the hourly statistic on the Energy dashboard under
 
 ## Cost tracking (dynamic tariff)
 
-If you have a dynamic tariff with an hourly price sensor (e.g. the
-[EPEX Spot](https://github.com/mampfes/ha_epex_spot) integration's *total price*
-sensor), the integration can compute accurate per-hour cost:
+If you have a dynamic tariff with an hourly or quarter-hourly price sensor
+(e.g. the [EPEX Spot](https://github.com/mampfes/ha_epex_spot) integration's
+*total price* sensor), the integration can compute per-hour cost that is
+accurate to the quarter hour.
 
 1. Open the integration's **Configure** dialog and select your price sensor.
 2. A new statistic `wiener_netze_smart_meter:<meter>_hourly_cost` (in €) is
-   produced: for each hour, `cost = energy_kWh × that hour's price`.
+   produced.
 3. On the Energy dashboard, set **"Use an entity tracking the total costs"** to
-   that statistic.
+   that statistic. (The *current price* and *static price* options are greyed
+   out for this source — they need a live entity to multiply against, and these
+   are imported historical statistics with no entity behind them.)
 
-This matches each hour's energy to that same hour's price, which is more
-accurate than Home Assistant's single current-price model. The price per hour is
-read from the price sensor's hourly statistics (for backfilled history),
-overlaid with its live forecast attribute for recent hours.
+### How the price is matched
+
+European day-ahead prices move every 15 minutes, and so does the meter's
+quarter-hour data. Each quarter-hour measurement is therefore priced against
+the price that actually applied to it, and only then are the costs summed into
+hourly rows. Averaging the four prices first and multiplying by the hourly
+total understates every hour in which load was shifted into a cheap quarter —
+which is the entire point of a dynamic tariff.
+
+Prices come from the first of these sources that fully covers an interval:
+
+| Source | Resolution | Reaches back |
+| --- | --- | --- |
+| The sensor's published schedule attribute (EPEX Spot style `data`) | native | today + tomorrow |
+| Recorder 5-minute short-term statistics | 5 min — resolves quarter-hour steps exactly | ~`purge_keep_days` (default 10) |
+| Recorder hourly statistics | hourly mean | indefinitely |
+
+Because measurements arrive 1–2 days late, routine updates are served by the
+5-minute tier and are exact. Only the deep backfill from the
+[import service](#services) falls back to hourly means, and the attribute
+rarely applies at all since it covers today forward.
+
+An hour whose intervals cannot all be priced is skipped rather than reported
+low, so a missing price shows as a gap in the graph instead of a plausible but
+wrong number.
+
+### What the price sensor must look like
+
+- **Numeric state with a `state_class`.** Recorder only builds statistics for
+  such sensors, and with lagged meter data those statistics are the only usable
+  price source. A sensor whose state is a status string, with the prices hidden
+  in an attribute, yields no cost at all — the picker will still accept it.
+- **Per kWh.** `ct/kWh` and `EUR/kWh` are both understood; the unit is read from
+  the entity and cents are converted automatically.
+- **All-in price.** The integration multiplies energy by whatever price it is
+  given. A raw market price produces cost excluding grid fees (*Netzkosten*),
+  levies and taxes — add those upstream in the price sensor if you want the
+  Energy dashboard to show your real bill.
+- Shortening recorder's `purge_keep_days` below the 1–2 day measurement lag
+  makes the 5-minute tier stop covering new data, silently dropping cost back
+  to hourly means.
 
 To verify it is working, go to **Developer Tools → Statistics** and search for
 `hourly_cost`. The `wiener_netze_smart_meter:<meter>_hourly_cost` entry should
-appear (unit €, no issue). Add it to a **Statistics Graph** card to see the
-per-hour cost, and sanity-check a single hour: `cost ≈ hourly kWh × price/kWh`
-for that hour. If it is missing, make sure the price sensor is selected in the
-integration's **Configure** dialog and that it has price history covering the
-hours you imported.
+appear (unit €, no issue). Add it to a **Statistics Graph** card and sanity-check
+one hour by hand against that hour's quarter-hour prices. If it is missing,
+check the price sensor against the requirements above and enable debug logging
+for `custom_components.wiener_netze_smart_meter` — the cost import logs how many
+hours were priced and how many were skipped.
 
 ## Services
 
@@ -109,8 +149,10 @@ while.
 
 - The official API publishes measurements with a **1–2 day delay**, so the most
   recent values always lag by a day or two.
-- Home Assistant long-term statistics are bucketed **hourly**, so sub-hour
-  (15-minute) resolution is not preserved on the Energy dashboard.
+- Home Assistant long-term statistics are bucketed **hourly**, so the Energy
+  dashboard cannot display 15-minute resolution. Cost is still *computed* per
+  quarter hour and only then summed into the hourly bucket, so the euros are
+  exact even though the display granularity is not.
 - Cost backfill only reaches as far back as your price integration retained its
   hourly price statistics.
 
